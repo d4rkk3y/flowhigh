@@ -101,7 +101,7 @@ class FlowHighSR(ConditionalFlowMatcherWrapper):
         HR_audio_pp = self.postproc.post_processing(HR_audio, cond, cond.size(-1)) # [1, T]
         return HR_audio_pp
 
-    @torch.no_grad()
+    @torch.inference_mode()  # Faster than no_grad()
     def generate_long(
         self,
         audio: np.ndarray,
@@ -111,126 +111,115 @@ class FlowHighSR(ConditionalFlowMatcherWrapper):
         chunk_duration_seconds=60.0,
         overlap_seconds=1.0,
     ):
-        """
-        Generate super-resolution audio for very long duration files without OOM error.
-        Processes audio in overlapping chunks and blends them using linear cross-fade.
-        
-        Args:
-            audio: Input audio as numpy array shape (samples,) or (1, samples)
-            sr: Input sampling rate
-            target_sampling_rate: Target sampling rate (default 48000)
-            timestep: Number of ODE steps (default 1)
-            chunk_duration_seconds: Duration of each chunk in seconds (default 10.0)
-            overlap_seconds: Overlap between chunks in seconds (default 1.0)
-            
-        Returns:
-            Super-resolved audio as torch.Tensor shape [1, T]
-        """
         if len(audio.shape) == 2:
             audio = audio.squeeze(0)
 
         if audio.max() > 1:
             audio = audio / 32768.0
 
-        # Upsample entire audio to target sampling rate (keep in CPU memory)
+        # NOTE: Ideally, upsampling should also be chunked for truly infinite length,
+        # but that requires complex context/padding management to avoid clicking.
+        # Keeping full upsampling here, but be aware this is the RAM bottleneck.
         if self.upsampling_method == 'scipy':
             cond_full = scipy.signal.resample_poly(audio, target_sampling_rate, sr)
         elif self.upsampling_method == 'librosa':
             cond_full = librosa.resample(audio, sr, target_sampling_rate, res_type='soxr_hq')
         else:
             raise ValueError(f"Unknown upsampling method: {self.upsampling_method}")
-        
-        # Normalize
+
         cond_full /= np.max(np.abs(cond_full))
         
-        # Split into overlapping chunks
+        # Pre-calculate dimensions
+        total_samples = len(cond_full)
         chunk_samples = int(chunk_duration_seconds * target_sampling_rate)
         overlap_samples = int(overlap_seconds * target_sampling_rate)
         stride_samples = chunk_samples - overlap_samples
-        
+
         if chunk_samples <= overlap_samples:
             raise ValueError("chunk_duration_seconds must be greater than overlap_seconds")
+
+        # Pre-calculate cross-fade window (create on Device to avoid transfers later if doing GPU mixing)
+        # However, since 'result' is on CPU, we keep weights on CPU to avoid mismatch errors during assignment
+        fade_weights = torch.linspace(0, 1, overlap_samples + 2, device='cpu')[1:-1]
         
-        total_samples = len(cond_full)
-        chunks = []
+        # Allocate Final Result Buffer (CPU)
+        result = torch.zeros(1, total_samples, device='cpu')
+        
         start = 0
+        total_chunks = (total_samples // stride_samples) + 1
+        
+        # Process loop
+        current_chunk_idx = 0
         
         while start < total_samples:
             end = min(start + chunk_samples, total_samples)
-            chunk = cond_full[start:end]
-            # Ensure chunk has at least some samples
-            if len(chunk) == 0:
+            
+            # 1. Prepare Input Chunk
+            chunk_np = cond_full[start:end]
+            if len(chunk_np) == 0: 
                 break
-            chunks.append((start, end, chunk))
-            start += stride_samples
-            # If we're at the last chunk and it's smaller than stride, break
-            if end == total_samples:
-                break
-        
-        # Process each chunk
-        processed_chunks = []
-        for i, (start, end, chunk) in enumerate(chunks):
-            # Convert chunk to tensor
-            chunk_tensor = torch.from_numpy(chunk).float().unsqueeze(0).to(self.device)
+                
+            chunk_tensor = torch.from_numpy(chunk_np).float().unsqueeze(0).to(self.device)
             
-            # Generate super-resolution for this chunk
-            if self.cfm_method == 'basic_cfm':
-                HR_chunk = self.sample(cond=chunk_tensor, time_steps=timestep, cfm_method=self.cfm_method)
-            elif self.cfm_method == 'independent_cfm_adaptive':
-                HR_chunk = self.sample(cond=chunk_tensor, time_steps=timestep, cfm_method=self.cfm_method, std_2=1.)
-            elif self.cfm_method == 'independent_cfm_constant':
-                HR_chunk = self.sample(cond=chunk_tensor, time_steps=timestep, cfm_method=self.cfm_method)
-            elif self.cfm_method == 'independent_cfm_mix':
-                HR_chunk = self.sample(cond=chunk_tensor, time_steps=timestep, cfm_method=self.cfm_method)
-            
-            HR_chunk = HR_chunk.squeeze(1)  # [1, T]
-            
-            # Post-processing
-            HR_chunk_pp = self.postproc.post_processing(HR_chunk, chunk_tensor, chunk_tensor.size(-1))
-            processed_chunks.append((start, end, HR_chunk_pp.cpu()))
-        
-        # Stitch chunks with linear cross-fade in overlap regions
-        result = torch.zeros(1, total_samples, device='cpu')
-        fade_weights = torch.linspace(0, 1, overlap_samples + 2)[1:-1]  # exclude 0 and 1
-        
-        for i, (start, end, chunk) in enumerate(processed_chunks):
-            chunk_length = chunk.size(-1)
-            if i == 0:
-                # First chunk: no fade at start
-                fade_start = 0
-                fade_end = min(overlap_samples, chunk_length)
-                if fade_end > 0:
-                    # Apply fade-out for overlapping part
-                    fade_out = 1 - fade_weights[:fade_end]
-                    chunk[:, :fade_end] *= fade_out
-                result[:, start:end] += chunk
-            elif i == len(processed_chunks) - 1:
-                # Last chunk: no fade at end
-                fade_start = max(0, chunk_length - overlap_samples)
-                fade_end = chunk_length
-                if fade_start < fade_end:
-                    # Apply fade-in for overlapping part
-                    fade_in = fade_weights[-(fade_end - fade_start):]
-                    chunk[:, fade_start:fade_end] *= fade_in
-                result[:, start:end] += chunk
+            # 2. Inference
+            # Helper to consolidate method calls
+            if self.cfm_method == 'independent_cfm_adaptive':
+                kwargs = {'std_2': 1.}
             else:
-                # Middle chunk: fade both sides
-                # Fade-in at start (overlap with previous chunk)
-                fade_start = 0
-                fade_end = min(overlap_samples, chunk_length)
-                if fade_end > 0:
-                    fade_in = fade_weights[:fade_end]
-                    chunk[:, fade_start:fade_end] *= fade_in
+                kwargs = {}
                 
-                # Fade-out at end (overlap with next chunk)
-                fade_start = max(0, chunk_length - overlap_samples)
-                fade_end = chunk_length
-                if fade_start < fade_end:
-                    fade_out = 1 - fade_weights[-(fade_end - fade_start):]
-                    chunk[:, fade_start:fade_end] *= fade_out
-                
-                result[:, start:end] += chunk
-        
+            HR_chunk = self.sample(
+                cond=chunk_tensor, 
+                time_steps=timestep, 
+                cfm_method=self.cfm_method, 
+                **kwargs
+            )
+            
+            HR_chunk = HR_chunk.squeeze(1) # [1, T_chunk]
+            
+            # 3. Post Processing
+            HR_chunk_pp = self.postproc.post_processing(
+                HR_chunk, chunk_tensor, chunk_tensor.size(-1)
+            )
+            
+            # 4. Move to CPU for stitching
+            # We process audio on CPU here to save VRAM, assuming the target array is huge
+            chunk_data = HR_chunk_pp.cpu()
+            chunk_length = chunk_data.size(-1)
+            
+            # 5. Apply Fading & Stitch immediately
+            # -----------------------------------------------
+            
+            # Fade In (Start) - apply to this chunk
+            # Only if not the very first chunk
+            if current_chunk_idx > 0:
+                fade_end_idx = min(overlap_samples, chunk_length)
+                chunk_data[:, :fade_end_idx] *= fade_weights[:fade_end_idx]
+
+            # Fade Out (End) - apply to this chunk
+            # Only if not the very last part of the file
+            if end < total_samples:
+                fade_start_idx = max(0, chunk_length - overlap_samples)
+                # Calculate how much overlap we actually have
+                actual_overlap = chunk_length - fade_start_idx
+                if actual_overlap > 0:
+                    chunk_data[:, fade_start_idx:] *= (1 - fade_weights[-actual_overlap:])
+
+            # Add to result buffer
+            # We add (+=) because the overlap region contains:
+            #   Previous Chunk (Faded Out) + Current Chunk (Faded In)
+            result[:, start:end] += chunk_data
+
+            # -----------------------------------------------
+            
+            # 6. Cleanup to prevent OOM
+            del chunk_tensor, HR_chunk, HR_chunk_pp, chunk_data
+            # Optional: empty cache if VRAM is extremely tight, but slows down loop
+            # torch.cuda.empty_cache() 
+            
+            start += stride_samples
+            current_chunk_idx += 1
+
         return result.to(self.device)
 
     def set_cfm_method(self, cfm_method):
